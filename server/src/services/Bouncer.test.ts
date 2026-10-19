@@ -509,4 +509,53 @@ describe.skipIf(process.env.INTEGRATION_TESTING == null)('getBranchUsage', () =>
     const usage = await bouncer.getBranchUsage({ runId, agentBranchNumber: TRUNK })
     assert.equal(usage.usage.total_seconds, 6)
   })
+
+  test('usage never goes negative for forged pause rows predating the branch', async () => {
+    await using helper = new TestHelper()
+    const bouncer = helper.get(Bouncer)
+    const dbBranches = helper.get(DBBranches)
+    const runId = await createRunWith100TokenUsageLimit(helper)
+    const startedAt = Date.now() - 10_000
+    const completedAt = Date.now()
+    await dbBranches.update({ runId, agentBranchNumber: TRUNK }, { startedAt, completedAt })
+
+    // Forged row written directly to the database (legacy row or a client predating the
+    // route-level validation): an epoch start must not subtract time from before the branch began.
+    await dbBranches.insertPause({
+      runId,
+      agentBranchNumber: TRUNK,
+      start: 0,
+      end: completedAt,
+      reason: RunPauseReason.PYHOOKS_RETRY,
+    })
+
+    const usage = await bouncer.getBranchUsage({ runId, agentBranchNumber: TRUNK })
+    assert.equal(usage.usage.total_seconds, 0)
+  })
+
+  test('usage floors at zero for overlapping forged pause rows', async () => {
+    await using helper = new TestHelper()
+    const bouncer = helper.get(Bouncer)
+    const dbBranches = helper.get(DBBranches)
+    const runId = await createRunWith100TokenUsageLimit(helper)
+    const startedAt = Date.now() - 10_000
+    const completedAt = Date.now()
+    await dbBranches.update({ runId, agentBranchNumber: TRUNK }, { startedAt, completedAt })
+
+    // The stealth-drip shape: overlapping closed rows within the branch's lifetime, inserted
+    // directly at the database level. Their sum exceeds the wall clock, so usage must floor at 0.
+    for (let i = 0; i < 5; i++) {
+      await dbBranches.insertPause({
+        runId,
+        agentBranchNumber: TRUNK,
+        start: startedAt,
+        end: completedAt,
+        reason: RunPauseReason.PYHOOKS_RETRY,
+      })
+    }
+
+    const usage = await bouncer.getBranchUsage({ runId, agentBranchNumber: TRUNK })
+    assert.equal(usage.usage.total_seconds, 0)
+    assert.ok(usage.usage.total_seconds >= 0)
+  })
 })

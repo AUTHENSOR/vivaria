@@ -38,7 +38,7 @@ import { checkActionSafety } from '../safety_policy'
 import { Bouncer, Config, DBRuns, DBTraceEntries, Middleman, OptionsRater, RunKiller, Slack } from '../services'
 import { Hosts } from '../services/Hosts'
 import { RunError } from '../services/RunKiller'
-import { DBBranches } from '../services/db/DBBranches'
+import { BranchKey, DBBranches } from '../services/db/DBBranches'
 import { DEFAULT_EXEC_RESULT } from '../services/db/DBRuns'
 import { RunPause } from '../services/db/tables'
 import { Scoring } from '../services/scoring'
@@ -49,6 +49,30 @@ import { agentProc } from './trpc_setup'
 
 const common = { runId: RunId, index: uint, agentBranchNumber: AgentBranchNumber, calledAt: uint } as const
 const obj = z.object
+
+/**
+ * pyhooks retroactively inserts pauses covering time spent retrying API requests (PR #237). That
+ * backdating is bounded by the retry wait, so a legitimate `start` always falls within the branch's
+ * lifetime: at or after `startedAt`, at or before now. Pauses are also only meaningful for branches
+ * that have started. Reject starts outside that window so that a client cannot forge a pause
+ * predating the branch and drive usage negative, and clamp future starts to now.
+ */
+async function validatedPauseStart(dbBranches: DBBranches, key: BranchKey, start: number): Promise<number> {
+  const branch = await dbBranches.getUsage(key)
+  if (branch == null) {
+    throw new TRPCError({
+      code: 'BAD_REQUEST',
+      message: `Branch ${key.agentBranchNumber} of run ${key.runId} has not started, so it cannot be paused`,
+    })
+  }
+  if (start < branch.startedAt) {
+    throw new TRPCError({
+      code: 'BAD_REQUEST',
+      message: `Pause start ${start} is before branch ${key.agentBranchNumber} of run ${key.runId} started at ${branch.startedAt}`,
+    })
+  }
+  return Math.min(start, Date.now())
+}
 
 export const hooksRoutes = {
   log: agentProc.input(obj({ ...common, content: LogEC.omit({ type: true }) })).mutation(async ({ ctx, input }) => {
@@ -495,10 +519,12 @@ export const hooksRoutes = {
     }),
   // TODO(deprecation): Remove once everyone is on pyhooks>=0.1.5
   insertPause: agentProc.input(RunPause.omit({ reason: true })).mutation(async ({ ctx, input }) => {
-    await ctx.svc.get(DBBranches).insertPause({ ...input, reason: RunPauseReason.LEGACY })
+    const start = await validatedPauseStart(ctx.svc.get(DBBranches), input, input.start)
+    await ctx.svc.get(DBBranches).insertPause({ ...input, start, reason: RunPauseReason.LEGACY })
   }),
   pause: agentProc.input(RunPause.omit({ end: true })).mutation(async ({ ctx, input }) => {
-    await ctx.svc.get(DBBranches).pause(input, input.start, input.reason)
+    const start = await validatedPauseStart(ctx.svc.get(DBBranches), input, input.start)
+    await ctx.svc.get(DBBranches).pause(input, start, input.reason)
   }),
   unpause: agentProc
     .input(

@@ -193,5 +193,7 @@ export function formatHeader(text: string): string {
 
 export function getUsageInSeconds(args: { startTimestamp: number; endTimestamp: number; pausedMs: number }): number {
   const usageMs = args.endTimestamp - args.startTimestamp - args.pausedMs
-  return Math.round(usageMs / 1000)
+  // Never report negative usage. pausedMs comes from pause rows, some of which are client-stamped
+  // and predate this clamping (e.g. imported runs or rows written by older server versions).
+  return Math.max(0, Math.round(usageMs / 1000))
 }

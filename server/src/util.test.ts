@@ -4,7 +4,7 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import { mock } from 'node:test'
 import { afterEach, beforeEach, describe, expect, test } from 'vitest'
-import { background, moveDirToBuildContextCache, oneTimeBackgroundProcesses } from './util'
+import { background, getUsageInSeconds, moveDirToBuildContextCache, oneTimeBackgroundProcesses } from './util'
 
 describe('background', () => {
   test('handles functions that throw errors', async () => {
@@ -36,6 +36,27 @@ describe('background', () => {
 
     assert.strictEqual(consoleWarn.mock.callCount(), 1)
     assert.deepStrictEqual(consoleWarn.mock.calls[0].arguments, [new Error('bg test: test')])
+  })
+})
+
+describe('getUsageInSeconds', () => {
+  test('computes usage excluding paused time', () => {
+    assert.equal(getUsageInSeconds({ startTimestamp: 0, endTimestamp: 10_000, pausedMs: 2_500 }), 8)
+  })
+
+  test('floors usage at zero when paused time exceeds elapsed time', () => {
+    // A client-stamped pause predating the branch can otherwise make usage hugely negative
+    // (e.g. start: 0 subtracting the entire epoch from the branch's elapsed time).
+    assert.equal(
+      getUsageInSeconds({
+        startTimestamp: 1_700_000_000_000,
+        endTimestamp: 1_700_003_600_000,
+        pausedMs: 1_700_003_600_000,
+      }),
+      0,
+    )
+    assert.equal(getUsageInSeconds({ startTimestamp: 0, endTimestamp: 10_000, pausedMs: 1_792_404_697_980 }), 0)
+    assert.equal(getUsageInSeconds({ startTimestamp: 0, endTimestamp: 10_000, pausedMs: 10_500 }), 0)
   })
 })
 

@@ -140,6 +140,7 @@ describe('hooks routes', { skip: process.env.INTEGRATION_TESTING == null }, () =
       await dbUsers.upsertUser('user-id', 'username', 'email')
       const runId = await insertRun(dbRuns, { batchName: null })
       const branchKey = { runId, agentBranchNumber: TRUNK }
+      await dbBranches.update(branchKey, { startedAt: Date.now() - 1000 })
 
       const trpc = getAgentTrpc(helper)
 
@@ -164,6 +165,7 @@ describe('hooks routes', { skip: process.env.INTEGRATION_TESTING == null }, () =
       await dbUsers.upsertUser('user-id', 'username', 'email')
       const runId = await insertRun(dbRuns, { batchName: null })
       const branchKey = { runId, agentBranchNumber: TRUNK }
+      await dbBranches.update(branchKey, { startedAt: Date.now() - 1000 })
 
       const trpc = getAgentTrpc(helper)
 
@@ -183,6 +185,85 @@ describe('hooks routes', { skip: process.env.INTEGRATION_TESTING == null }, () =
       const totalPausedMs = await dbBranches.getTotalPausedMs(branchKey)
       assert.equal(totalPausedMs, pausedMs)
     })
+
+    test('rejects a pause start before the branch started', async () => {
+      await using helper = new TestHelper()
+
+      const dbBranches = helper.get(DBBranches)
+      const dbRuns = helper.get(DBRuns)
+      const dbUsers = helper.get(DBUsers)
+
+      await dbUsers.upsertUser('user-id', 'username', 'email')
+      const runId = await insertRun(dbRuns, { batchName: null })
+      const branchKey = { runId, agentBranchNumber: TRUNK }
+      const startedAt = Date.now() - 1000
+      await dbBranches.update(branchKey, { startedAt })
+
+      const trpc = getAgentTrpc(helper)
+
+      for (const start of [0, startedAt - 1]) {
+        await assertThrows(
+          async () => {
+            await trpc.insertPause({ ...branchKey, start, end: null })
+          },
+          new TRPCError({
+            code: 'BAD_REQUEST',
+            message: `Pause start ${start} is before branch ${TRUNK} of run ${runId} started at ${startedAt}`,
+          }),
+        )
+      }
+
+      assert.deepEqual(await dbBranches.getPauses(branchKey), [])
+    })
+
+    test('rejects a pause on a branch that has not started', async () => {
+      await using helper = new TestHelper()
+
+      const dbBranches = helper.get(DBBranches)
+      const dbRuns = helper.get(DBRuns)
+      const dbUsers = helper.get(DBUsers)
+
+      await dbUsers.upsertUser('user-id', 'username', 'email')
+      const runId = await insertRun(dbRuns, { batchName: null })
+      const branchKey = { runId, agentBranchNumber: TRUNK }
+
+      const trpc = getAgentTrpc(helper)
+
+      await assertThrows(
+        async () => {
+          await trpc.insertPause({ ...branchKey, start: 0, end: null })
+        },
+        new TRPCError({
+          code: 'BAD_REQUEST',
+          message: `Branch ${TRUNK} of run ${runId} has not started, so it cannot be paused`,
+        }),
+      )
+
+      assert.deepEqual(await dbBranches.getPauses(branchKey), [])
+    })
+
+    test('clamps a future pause start to the current time', async () => {
+      await using helper = new TestHelper()
+
+      const dbBranches = helper.get(DBBranches)
+      const dbRuns = helper.get(DBRuns)
+      const dbUsers = helper.get(DBUsers)
+
+      await dbUsers.upsertUser('user-id', 'username', 'email')
+      const runId = await insertRun(dbRuns, { batchName: null })
+      const branchKey = { runId, agentBranchNumber: TRUNK }
+      await dbBranches.update(branchKey, { startedAt: Date.now() - 1000 })
+
+      const trpc = getAgentTrpc(helper)
+
+      const before = Date.now()
+      await trpc.insertPause({ ...branchKey, start: before + 60_000, end: null })
+
+      const pauses = await dbBranches.getPauses(branchKey)
+      assert.equal(pauses.length, 1)
+      assert.equal(pauses[0].reason, RunPauseReason.LEGACY)
+      assert.ok(pauses[0].start >= before && pauses[0].start <= Date.now())
+    })
   })
 
   describe('pause', () => {
@@ -196,6 +277,7 @@ describe('hooks routes', { skip: process.env.INTEGRATION_TESTING == null }, () =
       await dbUsers.upsertUser('user-id', 'username', 'email')
       const runId = await insertRun(dbRuns, { batchName: null })
       const branchKey = { runId, agentBranchNumber: TRUNK }
+      await dbBranches.update(branchKey, { startedAt: Date.now() - 1000 })
 
       const trpc = getAgentTrpc(helper)
 
@@ -208,6 +290,58 @@ describe('hooks routes', { skip: process.env.INTEGRATION_TESTING == null }, () =
 
       const pausedReason = await dbBranches.pausedReason(branchKey)
       assert.equal(pausedReason, RunPauseReason.PAUSE_HOOK)
+    })
+
+    test('pauses retroactively within the retry wait', async () => {
+      await using helper = new TestHelper()
+
+      const dbBranches = helper.get(DBBranches)
+      const dbRuns = helper.get(DBRuns)
+      const dbUsers = helper.get(DBUsers)
+
+      await dbUsers.upsertUser('user-id', 'username', 'email')
+      const runId = await insertRun(dbRuns, { batchName: null })
+      const branchKey = { runId, agentBranchNumber: TRUNK }
+      await dbBranches.update(branchKey, { startedAt: Date.now() - 60_000 })
+
+      const trpc = getAgentTrpc(helper)
+
+      // pyhooks inserts a pyhooksRetry pause stamped at the start of a rate-limit retry wait.
+      const retryWaitMs = 2_000
+      const start = Date.now() - retryWaitMs
+      await trpc.pause({ ...branchKey, start, reason: RunPauseReason.PYHOOKS_RETRY })
+      await trpc.unpause({ ...branchKey, reason: 'pyhooksRetry' })
+
+      const totalPausedMs = await dbBranches.getTotalPausedMs(branchKey)
+      assert.ok(totalPausedMs >= retryWaitMs && totalPausedMs <= retryWaitMs + 5_000)
+    })
+
+    test('rejects a forged pause start before the branch started', async () => {
+      await using helper = new TestHelper()
+
+      const dbBranches = helper.get(DBBranches)
+      const dbRuns = helper.get(DBRuns)
+      const dbUsers = helper.get(DBUsers)
+
+      await dbUsers.upsertUser('user-id', 'username', 'email')
+      const runId = await insertRun(dbRuns, { batchName: null })
+      const branchKey = { runId, agentBranchNumber: TRUNK }
+      const startedAt = Date.now() - 1000
+      await dbBranches.update(branchKey, { startedAt })
+
+      const trpc = getAgentTrpc(helper)
+
+      await assertThrows(
+        async () => {
+          await trpc.pause({ ...branchKey, start: 0, reason: RunPauseReason.PYHOOKS_RETRY })
+        },
+        new TRPCError({
+          code: 'BAD_REQUEST',
+          message: `Pause start 0 is before branch ${TRUNK} of run ${runId} started at ${startedAt}`,
+        }),
+      )
+
+      assert.deepEqual(await dbBranches.getPauses(branchKey), [])
     })
   })
 

@@ -276,7 +276,7 @@ describe.skipIf(process.env.INTEGRATION_TESTING == null)('DBBranches', () => {
       const runId = await insertRun(dbRuns, { batchName: null })
       const branchKey = { runId, agentBranchNumber: TRUNK }
 
-      const startTime = Date.now()
+      const startTime = Date.now() - 1000
       await dbBranches.update(branchKey, { startedAt: startTime })
 
       // Add a completed pause
@@ -325,6 +325,44 @@ describe.skipIf(process.env.INTEGRATION_TESTING == null)('DBBranches', () => {
       await dbBranches.update(branchKey, { completedAt })
 
       assert.equal(await dbBranches.getTotalPausedMs(branchKey), 600) // (200-100) + (1000-500)
+    })
+
+    test('clamps pause rows that predate the branch start', async () => {
+      await using helper = new TestHelper()
+      const dbRuns = helper.get(DBRuns)
+      const dbBranches = helper.get(DBBranches)
+
+      await helper.get(DBUsers).upsertUser('user-id', 'username', 'email')
+      const runId = await insertRun(dbRuns, { batchName: null })
+      const branchKey = { runId, agentBranchNumber: TRUNK }
+
+      const startedAt = Date.now() - 10_000
+      const completedAt = Date.now()
+      await dbBranches.update(branchKey, { startedAt, completedAt })
+
+      // Forged row inserted directly into the database (legacy data, or a client predating the
+      // route-level validation): a start at the epoch must only count from startedAt.
+      await dbBranches.insertPause({ ...branchKey, start: 0, end: completedAt, reason: RunPauseReason.PYHOOKS_RETRY })
+
+      assert.equal(await dbBranches.getTotalPausedMs(branchKey), completedAt - startedAt)
+    })
+
+    test('clamps an open pause row that predates the branch start', async () => {
+      await using helper = new TestHelper()
+      const dbRuns = helper.get(DBRuns)
+      const dbBranches = helper.get(DBBranches)
+
+      await helper.get(DBUsers).upsertUser('user-id', 'username', 'email')
+      const runId = await insertRun(dbRuns, { batchName: null })
+      const branchKey = { runId, agentBranchNumber: TRUNK }
+
+      const startedAt = Date.now() - 10_000
+      const completedAt = Date.now()
+      await dbBranches.update(branchKey, { startedAt, completedAt })
+
+      await dbBranches.pause(branchKey, 0, RunPauseReason.PYHOOKS_RETRY)
+
+      assert.equal(await dbBranches.getTotalPausedMs(branchKey), completedAt - startedAt)
     })
   })
 

@@ -691,8 +691,11 @@ SELECT
     - branch."startedAt"
     - (
       SELECT COALESCE(SUM(
-        COALESCE(pause."end", branch."completedAt", EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)
-        - pause."start"
+        GREATEST(
+          COALESCE(pause."end", branch."completedAt", EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000)
+          - GREATEST(pause."start", branch."startedAt"),
+          0
+        )
       ), 0)
       FROM run_pauses_t pause
       WHERE pause."runId" = run.id AND pause."agentBranchNumber" = 0
